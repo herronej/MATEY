@@ -48,8 +48,11 @@ class Trainer:
         self.startEpoch = 0
         self.epoch = 0
         self.mp_type = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.half
+        self.use_pipeline = getattr(params, 'use_pipeline', False)
 
         self.profiling = self.params.profiling if hasattr(self.params, "profiling") else False
+
+
 
         #define sequence parallel groups and local group info
         if hasattr(self.params, "sp_groupsize"):

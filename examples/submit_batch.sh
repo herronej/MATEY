@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH -A LRN037
+#SBATCH -A stf218
 #SBATCH -J matey
-#SBATCH -o %x-%j.out
+#SBATCH -o logs/%x-%j.out
 #SBATCH -t 00:05:00
 #SBATCH -p batch
 #SBATCH -N 1
