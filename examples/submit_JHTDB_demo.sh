@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH -A lrn037
+#SBATCH -A stf218
 #SBATCH -J matey
-#SBATCH -o %x-%j.out
+#SBATCH -o logs/%x-%j.out
 #SBATCH -t 00:10:00
 #SBATCH -p batch
 ##SBATCH -p extended
@@ -16,7 +16,16 @@ export run_name="demo"
 export config="basic_config" 
 export yaml_config=./config/Demo_JHUTDB_TT.yaml
 
-source /lustre/orion/world-shared/stf218/junqi/forge/matey-env-rocm631.sh
+#source /lustre/orion/world-shared/stf218/junqi/forge/matey-env-rocm631.sh
+
+
+module load miniforge3/23.11.0
+module load gcc/12.2.0
+module load rocm/6.3.1
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate /lustre/orion/stf218/world-shared/emily/MATEY/matey_env
+module unload miniforge3/23.11.0
+
 export PYTHONPATH="${PYTHONPATH}:$(dirname "$PWD")"
 
 export MIOPEN_USER_DB_PATH=/mnt/bb/$USER/MIOPEN$SLURM_JOB_ID
