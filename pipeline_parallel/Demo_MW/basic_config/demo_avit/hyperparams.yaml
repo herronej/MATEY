@@ -1,0 +1,60 @@
+log_to_screen: 'True'
+save_checkpoint: 'True'
+checkpoint_save_interval: '10'
+true_time: 'False'
+num_data_workers: '2'
+enable_amp: 'False'
+compile: 'False'
+gradient_checkpointing: 'False'
+exp_dir: Demo_MW
+log_interval: '1'
+pretrained: 'False'
+drop_path: '0.1'
+batch_size: '2'
+max_epochs: '5'
+scheduler_epochs: '-1'
+epoch_size: '10'
+rescale_gradients: 'False'
+optimizer: AdamW
+scheduler: cosine
+warmup_steps: '10'
+learning_rate: '0.001'
+weight_decay: '0.001'
+n_states: '15'
+state_names: "['Pressure', 'Vx', 'Vy', 'Density', 'Vx', 'Vy', 'Density', 'Pressure']"
+dt: '1'
+n_steps: '2'
+enforce_max_steps: 'False'
+accum_grad: '2'
+model_type: avit
+time_type: attention
+space_type: axial_attention
+tie_fields: 'False'
+embed_dim: '192'
+num_heads: '3'
+processor_blocks: '12'
+tokenizer_heads: "[{'head_name': 'tk-2D', 'patch_size': [[1, 16, 16]]}]"
+adaptive: 'False'
+sts_model: 'False'
+adap_samp: 'False'
+nrefines: '0'
+bias_type: none
+train_val_test: '[0.8, 0.1, 0.1]'
+augmentation: 'False'
+use_all_fields: 'True'
+tie_batches: 'False'
+extended_names: 'False'
+embedding_offset: '0'
+train_data_paths: "[['/lustre/orion/lrn037/proj-shared/miniweather_thermals_tiny/train',
+  'thermalcollision2d', '', 'tk-2D']]"
+valid_data_paths: "[['/lustre/orion/lrn037/proj-shared/miniweather_thermals_tiny/test',
+  'thermalcollision2d', '', 'tk-2D']]"
+append_datasets: '[]'
+startEpoch: '0'
+old_exp_dir: Demo_MW/basic_config/demo_avit
+experiment_dir: 
+  /lustre/orion/stf218/world-shared/emily/MATEY/examples/Demo_MW/basic_config/demo_avit
+checkpoint_path: Demo_MW/basic_config/demo_avit/training_checkpoints/ckpt.tar
+best_checkpoint_path: Demo_MW/basic_config/demo_avit/training_checkpoints/best_ckpt.tar
+old_checkpoint_path: Demo_MW/basic_config/demo_avit/training_checkpoints/best_ckpt.tar
+resuming: 'False'

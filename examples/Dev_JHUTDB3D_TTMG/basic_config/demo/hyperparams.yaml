@@ -1,0 +1,61 @@
+log_to_screen: 'True'
+save_checkpoint: 'True'
+checkpoint_save_interval: '1'
+true_time: 'False'
+num_data_workers: '2'
+enable_amp: 'False'
+compile: 'False'
+gradient_checkpointing: 'False'
+exp_dir: ./Dev_JHUTDB3D_TTMG
+log_interval: '1'
+pretrained: 'False'
+drop_path: '0.1'
+max_epochs: '5'
+scheduler_epochs: '-1'
+epoch_size: '10'
+rescale_gradients: 'False'
+optimizer: AdamW
+scheduler: cosine
+warmup_steps: '5'
+learning_rate: '0.001'
+weight_decay: '0.001'
+n_states: '15'
+state_names: "['Pressure', 'Vx', 'Vy', 'Density', 'Vx', 'Vy', 'Density', 'Pressure']"
+dt: '1'
+n_steps: '3'
+enforce_max_steps: 'False'
+accum_grad: '1'
+model_type: turbt
+tie_fields: 'False'
+embed_dim: '192'
+num_heads: '3'
+processor_blocks: '12'
+tokenizer_heads: "[{'head_name': 'tk-3D', 'patch_size': [[4, 4, 4]]}]"
+hierarchical: "{'filtersize': 2, 'nlevels': 3, 'fixedupsample': False, 'linearupsample':
+  False}"
+notransposed: 'False'
+batch_size: '4'
+sp_groupsize: '8'
+sts_model: 'False'
+sts_train: 'False'
+bias_type: PositionAreaBias
+bias_MLP: 'True'
+train_val_test: '[0.8, 0.1, 0.1]'
+augmentation: 'False'
+use_all_fields: 'True'
+tie_batches: 'False'
+extended_names: 'False'
+embedding_offset: '0'
+train_data_paths: "[['/lustre/orion/lrn037/world-shared/isotropic1024fine/', 'isotropic1024fine',
+  '', 'tk-3D']]"
+valid_data_paths: "[['/lustre/orion/lrn037/world-shared/isotropic1024fine/', 'isotropic1024fine',
+  '', 'tk-3D']]"
+append_datasets: '[]'
+startEpoch: '0'
+old_exp_dir: ./Dev_JHUTDB3D_TTMG/basic_config/demo
+experiment_dir: 
+  /lustre/orion/stf218/world-shared/emily/MATEY/examples/Dev_JHUTDB3D_TTMG/basic_config/demo
+checkpoint_path: ./Dev_JHUTDB3D_TTMG/basic_config/demo/training_checkpoints/ckpt.tar
+best_checkpoint_path: ./Dev_JHUTDB3D_TTMG/basic_config/demo/training_checkpoints/best_ckpt.tar
+old_checkpoint_path: ./Dev_JHUTDB3D_TTMG/basic_config/demo/training_checkpoints/best_ckpt.tar
+resuming: 'False'
