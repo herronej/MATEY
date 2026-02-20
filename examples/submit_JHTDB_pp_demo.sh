@@ -16,12 +16,12 @@ export run_name="demo"
 export config="basic_config" 
 export yaml_config=./config/Demo_JHUTDB_TT.yaml
 
-#source /lustre/orion/world-shared/stf218/junqi/forge/matey-env-rocm631.sh
 module load miniforge3/23.11.0
 module load gcc/12.2.0
 module load rocm/6.3.1
 source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate /lustre/orion/stf218/world-shared/emily/MATEY/matey_env
+#conda activate /lustre/orion/stf218/world-shared/emily/MATEY/matey_env
+conda activate /lustre/orion/stf218/world-shared/emily/MATEY/matey_env_3_10
 module unload miniforge3/23.11.0
 export PYTHONPATH="${PYTHONPATH}:$(dirname "$PWD")"
 
@@ -34,6 +34,8 @@ mkdir -p ${MIOPEN_USER_DB_PATH}
 export MASTER_ADDR=$(hostname -i)
 export MASTER_PORT=3442
 ##export NCCL_DEBUG=INFO 
+
+HOME=/lustre/orion/stf218/world-shared/emily/MATEY
 
 srun -N$SLURM_JOB_NUM_NODES -n$((SLURM_JOB_NUM_NODES*8)) -c7 --gpu-bind=closest python basic_usage.py \
 --run_name $run_name --config $config --yaml_config $yaml_config --use_ddp --use_pipeline --pipeline_stages 4 --zero_stage 1

@@ -232,7 +232,7 @@ class BaseHDF53DDataset(Dataset):
             #generate a random leadtime uniformly sampled from [1, self.leadtime_max]
             available_future = len(self.timesteps) - (time_idx + self.nsteps_input)
             max_lead = max(1, min(self.leadtime_max, available_future))
-            print("max_lead", max_lead, flush=True)
+            #print("max_lead", max_lead, flush=True)
             leadtime = torch.randint(1, max_lead + 1, (1,)) #torch.randint(1, min(self.leadtime_max+1, len(self.timesteps)-time_idx-self.nsteps_input+1), (1,))
         else:
             leadtime = min(leadtime, len(self.timesteps)-time_idx-self.nsteps_input)

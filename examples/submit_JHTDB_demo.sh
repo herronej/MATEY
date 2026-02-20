@@ -23,7 +23,8 @@ module load miniforge3/23.11.0
 module load gcc/12.2.0
 module load rocm/6.3.1
 source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate /lustre/orion/stf218/world-shared/emily/MATEY/matey_env
+#conda activate /lustre/orion/stf218/world-shared/emily/MATEY/matey_env
+conda activate /lustre/orion/stf218/world-shared/emily/MATEY/matey_env_3_10
 module unload miniforge3/23.11.0
 
 export PYTHONPATH="${PYTHONPATH}:$(dirname "$PWD")"

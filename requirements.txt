@@ -16,5 +16,6 @@ mpi4py
 scipy
 matplotlib
 netCDF4
-flash-attn
+#flash-attn
 scikit-learn
+torch_geometric

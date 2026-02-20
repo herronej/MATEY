@@ -15,9 +15,11 @@ class ForwardOptionsBase:
     #always passed
     imod: int = 0
     tkhead_name: Optional[str] = None
-    leadtime: Optional[int]|None = None  
+    #leadtime: Optional[int]|None = None  
+    leadtime: Optional[int] = None 
     #optional
-    sequence_parallel_group: Any|None = None  
+    #sequence_parallel_group: Any|None = None  
+    sequence_parallel_group: Optional[Any] = None
     blockdict: Optional[Dict[str, Any]] = None
     cond_dict: Optional[Dict[str, Any]] = None
     cond_input: Optional[Tensor] = None
