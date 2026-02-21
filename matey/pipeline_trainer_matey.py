@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 UT-Battelle, LLC
+# This file is part of the MATEY Project.
+
+import os
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -93,9 +98,10 @@ class MATEYPipelineDatasetWrapper(Dataset):
         return (input_tuple, label_data)
 
 
-def create_matey_pipeline(base_model, params):
+def create_matey_pipeline(base_model, params, global_rank=0):
     """
     Creates pipeline stages for MATEY models using tuple + bit-level view method.
+    Supports: ViT variants (vit_all2all, avit, svit) and TURBT (hierarchical turbulence model)
     """
     layers = []
     
@@ -253,14 +259,15 @@ def create_matey_pipeline(base_model, params):
                 # Graph data - features are already in correct format
                 return features
     
-    # Determine tokenizer head
-    tkhead_name = "default"  # Adjust based on your config
+    # ====================================================================
+    # Model-specific pipeline construction
+    # ====================================================================
     
     if params.model_type in ['vit_all2all', 'avit', 'svit']:
+        # Standard ViT-based models
+        tkhead_name = "default"
         encoder_embed_tokenizer = base_model.tokenizer_ensemble_heads[-1][tkhead_name]["embed"][-1]
         decoder_debed_tokenizer = base_model.tokenizer_ensemble_heads[-1][tkhead_name]["debed"][-1]
-        #encoder_embed_tokenizer = base_model.tokenizer_ensemble_heads[tkhead_name]["embed"][-1]
-        #decoder_debed_tokenizer = base_model.tokenizer_ensemble_heads[tkhead_name]["debed"][-1]
         coarse_patch_size = encoder_embed_tokenizer.patch_size
         
         # Encoding stage
@@ -277,8 +284,169 @@ def create_matey_pipeline(base_model, params):
         layers.append(DecodingPipeStage(decoder_debed_tokenizer, coarse_patch_size))
     
     elif params.model_type == 'turbt':
-        # TURBT model has different structure - implement accordingly
-        raise NotImplementedError("Pipeline parallelism for TURBT not yet implemented")
+        # TURBT hierarchical model
+        
+        # tokenizer_ensemble_heads is a ModuleList, not ModuleDict
+        if global_rank == 0:
+            print(f"Tokenizer ensemble heads type: {type(base_model.tokenizer_ensemble_heads)}", flush=True)
+            print(f"Number of tokenizer heads: {len(base_model.tokenizer_ensemble_heads)}", flush=True)
+        
+        # Determine which tokenizer head to use
+        head_idx = 0  # Default to first head
+        if hasattr(params, 'tokenizer_heads') and len(params.tokenizer_heads) > 0:
+            tkhead_name = params.tokenizer_heads[0]['head_name']
+            if isinstance(tkhead_name, int):
+                head_idx = tkhead_name
+            elif tkhead_name != 'default':
+                try:
+                    head_idx = int(tkhead_name)
+                except (ValueError, TypeError):
+                    if global_rank == 0:
+                        print(f"Warning: Could not parse head_name '{tkhead_name}', using index 0", flush=True)
+        
+        if global_rank == 0:
+            print(f"Using tokenizer head index: {head_idx}", flush=True)
+        
+        # Get the tokenizer head by index
+        try:
+            tokenizer_head = base_model.tokenizer_ensemble_heads[head_idx]
+            
+            if global_rank == 0:
+                print(f"Tokenizer head type: {type(tokenizer_head)}", flush=True)
+            
+            # Inspect what's actually in the tokenizer_head
+            if isinstance(tokenizer_head, nn.ModuleDict):
+                actual_keys = list(tokenizer_head.keys())
+                if global_rank == 0:
+                    print(f"Tokenizer head keys: {actual_keys}", flush=True)
+                
+                # Try to find encoder and decoder components with various naming conventions
+                encoder_key = None
+                decoder_key = None
+                
+                for key in actual_keys:
+                    key_lower = key.lower()
+                    if 'embed' in key_lower or 'encode' in key_lower or 'enc' in key_lower:
+                        encoder_key = key
+                    if 'debed' in key_lower or 'decode' in key_lower or 'dec' in key_lower or 'output' in key_lower:
+                        decoder_key = key
+                
+                if encoder_key is None or decoder_key is None:
+                    if global_rank == 0:
+                        print(f"Could not find encoder/decoder keys. Available keys: {actual_keys}", flush=True)
+                        print("Assuming keys are in order: first for encoder, last for decoder", flush=True)
+                    encoder_key = actual_keys[0]
+                    decoder_key = actual_keys[-1]
+                
+                if global_rank == 0:
+                    print(f"Using encoder key: '{encoder_key}', decoder key: '{decoder_key}'", flush=True)
+                
+                embed_tokenizers = tokenizer_head[encoder_key]
+                debed_tokenizers = tokenizer_head[decoder_key]
+                
+            elif hasattr(tokenizer_head, '__dict__'):
+                # Try attribute-based access
+                if global_rank == 0:
+                    print(f"Tokenizer head attributes: {list(vars(tokenizer_head).keys())}", flush=True)
+                
+                # Try common attribute names
+                if hasattr(tokenizer_head, 'embed'):
+                    embed_tokenizers = tokenizer_head.embed
+                    debed_tokenizers = tokenizer_head.debed
+                elif hasattr(tokenizer_head, 'encoder'):
+                    embed_tokenizers = tokenizer_head.encoder
+                    debed_tokenizers = tokenizer_head.decoder
+                else:
+                    raise AttributeError(f"Cannot find encoder/decoder in tokenizer_head with attributes: {list(vars(tokenizer_head).keys())}")
+            else:
+                raise TypeError(f"Unexpected tokenizer_head structure: {type(tokenizer_head)}")
+            
+            # Get the actual tokenizer modules
+            if isinstance(embed_tokenizers, (nn.ModuleList, list)):
+                if global_rank == 0:
+                    print(f"Number of embed tokenizers: {len(embed_tokenizers)}", flush=True)
+                encoder_embed_tokenizer = embed_tokenizers[-1]  # Use last/finest resolution
+                decoder_debed_tokenizer = debed_tokenizers[-1]
+            else:
+                # Single module
+                encoder_embed_tokenizer = embed_tokenizers
+                decoder_debed_tokenizer = debed_tokenizers
+            
+            if global_rank == 0:
+                print(f"Encoder tokenizer type: {type(encoder_embed_tokenizer)}", flush=True)
+                print(f"Decoder tokenizer type: {type(decoder_debed_tokenizer)}", flush=True)
+            
+            coarse_patch_size = encoder_embed_tokenizer.patch_size
+            if global_rank == 0:
+                print(f"Patch size: {coarse_patch_size}", flush=True)
+            
+        except Exception as e:
+            if global_rank == 0:
+                print(f"Error accessing tokenizer heads: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+            raise
+        
+        # Encoding stage
+        layers.append(EncodingPipeStage(
+            base_model.space_bag,
+            encoder_embed_tokenizer,
+            base_model.posbias,
+            params
+        ))
+        
+        # Transformer blocks
+        if global_rank == 0:
+            print(f"Processing transformer blocks...", flush=True)
+        
+        if hasattr(base_model, 'hierarchical_blocks'):
+            if global_rank == 0:
+                print(f"Using hierarchical_blocks: {type(base_model.hierarchical_blocks)}", flush=True)
+            # If model explicitly stores hierarchical blocks
+            for level_idx, level_blocks in enumerate(base_model.hierarchical_blocks):
+                if isinstance(level_blocks, (list, nn.ModuleList)):
+                    if global_rank == 0:
+                        print(f"  Level {level_idx}: {len(level_blocks)} blocks", flush=True)
+                    for block in level_blocks:
+                        layers.append(TransformerPipeStage(block))
+                else:
+                    # Single block at this level
+                    if global_rank == 0:
+                        print(f"  Level {level_idx}: single block", flush=True)
+                    layers.append(TransformerPipeStage(level_blocks))
+        
+        elif hasattr(base_model, 'blocks'):
+            if global_rank == 0:
+                print(f"Using blocks: {type(base_model.blocks)}", flush=True)
+            # Fallback: treat as sequential blocks
+            if isinstance(base_model.blocks, (list, nn.ModuleList)):
+                if global_rank == 0:
+                    print(f"  Total blocks: {len(base_model.blocks)}", flush=True)
+                for idx, block in enumerate(base_model.blocks):
+                    layers.append(TransformerPipeStage(block))
+            else:
+                raise AttributeError("base_model.blocks is not iterable")
+        
+        else:
+            # Last resort: try to find blocks by inspection
+            if global_rank == 0:
+                print("Warning: Could not find 'blocks' or 'hierarchical_blocks' attribute", flush=True)
+                # Print non-private attributes
+                attrs = [attr for attr in dir(base_model) if not attr.startswith('_')]
+                print(f"Available attributes: {attrs[:20]}...", flush=True)  # Print first 20 to avoid spam
+            raise AttributeError("TURBT model does not have expected 'blocks' or 'hierarchical_blocks' attribute")
+        
+        if global_rank == 0:
+            print(f"Total pipeline layers before decoding: {len(layers)}", flush=True)
+        
+        # Decoding stage
+        layers.append(DecodingPipeStage(decoder_debed_tokenizer, coarse_patch_size))
+        
+        if global_rank == 0:
+            print(f"Total pipeline layers: {len(layers)}", flush=True)
+    
+    else:
+        raise ValueError(f"Unknown model type for pipeline: {params.model_type}")
     
     return layers
 
@@ -378,16 +546,12 @@ def train_with_pipeline_matey(params, global_rank, local_rank, world_size):
     """
     # Build base model
     if params.model_type == 'avit':
-        from .models.avit import build_avit
         base_model = build_avit(params)
     elif params.model_type == "svit":
-        from .models.svit import build_svit
         base_model = build_svit(params)
     elif params.model_type == "vit_all2all":
-        from .models.vit import build_vit
         base_model = build_vit(params)
     elif params.model_type == "turbt":
-        from .models.turbt import build_turbt
         base_model = build_turbt(params)
     else:
         raise ValueError(f"Unknown model type: {params.model_type}")
@@ -409,8 +573,8 @@ def train_with_pipeline_matey(params, global_rank, local_rank, world_size):
     if global_rank == 0:
         print("Creating MATEY pipeline with tuple-based method...")
     
-    # Create pipeline layers
-    layers = create_matey_pipeline(base_model, params)
+    # Create pipeline layers - NOW PASSING global_rank
+    layers = create_matey_pipeline(base_model, params, global_rank)
     
     # Define loss function
     def matey_loss_fn(outputs, targets):
@@ -450,7 +614,7 @@ def train_with_pipeline_matey(params, global_rank, local_rank, world_size):
             "type": "AdamW",
             "params": {
                 "lr": params.learning_rate,
-                "weight_decay": params.weight_decay,
+                "weight_decay": params.weight_decay if hasattr(params, 'weight_decay') else 0.0,
                 "torch_adam": True
             }
         },
@@ -557,6 +721,7 @@ def train_with_pipeline_matey(params, global_rank, local_rank, world_size):
                     checkpoint_path = os.path.join(params.experiment_dir, 
                                                   f'training_checkpoints/ckpt_epoch{current_epoch}')
                     engine.save_checkpoint(checkpoint_path)
+                    print(f"Checkpoint saved: {checkpoint_path}")
             
             epoch_start_time = time.time()
             last_loss_tensor.zero_()
