@@ -31,14 +31,57 @@ class MATEYPipelineDatasetWrapper(Dataset):
     Wrapper for MATEY datasets to format data for DeepSpeed PipelineModule.
     Handles both grid-based and graph-based data.
     """
-    def __init__(self, original_dataset):
+    def __init__(self, original_dataset, hierarchical=None):
         self.original_dataset = original_dataset
         self._length = len(original_dataset)
+        # For turbt: filter targets down to coarsest level resolution
+        self.hierarchical = hierarchical
+        if hierarchical is not None:
+            from matey.data_utils.utils import construct_filterkernel, construct_filterkernel2D
+            self.filtersize = hierarchical["filtersize"]
+            self.nhlevels = hierarchical["nlevels"]
+            self.datafilter_kernel = construct_filterkernel(self.filtersize)
+            self.datafilter_kernel2D = construct_filterkernel2D(self.filtersize)
         
     def __len__(self):
         return self._length
     
+    def _filter_to_coarsest(self, x):
+        """Apply low-pass filtering (nhlevels-1) times to match coarsest resolution.
+        Input x: [T, C, D, H, W] or [C, D, H, W]"""
+        if self.hierarchical is None:
+            return x
+        squeeze = False
+        if x.ndim == 4:
+            x = x.unsqueeze(0)  # Add T dim
+            squeeze = True
+        T, C, D, H, W = x.shape
+        for _ in range(self.nhlevels - 1):
+            x_flat = x.reshape(T * C, D, H, W)
+            if D == 1:
+                filtered = F.conv3d(x_flat[:, None, :, :, :], self.datafilter_kernel2D,
+                                   stride=(1, self.filtersize, self.filtersize))
+            else:
+                filtered = F.conv3d(x_flat[:, None, :, :, :], self.datafilter_kernel,
+                                   stride=self.filtersize)
+            filtered = filtered.squeeze(1)  # Remove the c1=1 dim
+            _, D, H, W = filtered.shape
+            x = filtered.reshape(T, C, D, H, W)
+        if squeeze:
+            x = x.squeeze(0)
+        return x
+    
     def __getitem__(self, idx):
+        # Ensure idx is a plain Python int — the underlying dataset uses numpy
+        # operations (np.searchsorted, subtraction with offsets) that fail if
+        # idx is a numpy array or tensor rather than a scalar int.
+        if isinstance(idx, (torch.Tensor,)):
+            idx = idx.item()
+        elif hasattr(idx, '__index__'):
+            idx = idx.__index__()
+        else:
+            idx = int(idx)
+        
         data = self.original_dataset[idx]
         
         # Handle graph data
@@ -53,10 +96,10 @@ class MATEYPipelineDatasetWrapper(Dataset):
                 data["field_labels_out"],
                 data["bcs"],
                 leadtime,
-                data.get("cond_input", None),
-                data.get("cond_field_labels", None),
-                data.get("cond_fields", None),
-                True  # is_graph flag
+                self._to_tensor(data.get("cond_input", None)),
+                self._to_tensor(data.get("cond_field_labels", None)),
+                self._to_tensor(data.get("cond_fields", None)),
+                torch.tensor([1], dtype=torch.long)  # is_graph=True
             )
         else:
             # Grid-based data
@@ -88,14 +131,34 @@ class MATEYPipelineDatasetWrapper(Dataset):
                 field_labels,  # field_labels_out (same as input for grid)
                 bcs,
                 leadtime,
-                data.get("cond_input", None),
-                data.get("cond_field_labels", None),
-                data.get("cond_fields", None),
-                False  # is_graph flag
+                self._to_tensor(data.get("cond_input", None)),
+                self._to_tensor(data.get("cond_field_labels", None)),
+                self._to_tensor(data.get("cond_fields", None)),
+                torch.tensor([0], dtype=torch.long)  # is_graph=False
             )
         
         label_data = tar
+        # For turbt hierarchical: filter target spatially to coarsest level
+        # to match model output resolution. Do NOT index by field_labels — the
+        # target already contains only the relevant physical fields (e.g., 4 for
+        # isotropic1024fine), while field_labels are global indices into the
+        # n_states embedding space.
+        if self.hierarchical is not None and not ("graph" in data):
+            with torch.no_grad():
+                label_data = self._filter_to_coarsest(tar.float())
+                # Take last timestep if time dimension present
+                if label_data.ndim == 5:  # [T, C, D, H, W]
+                    label_data = label_data[-1]  # [C, D_coarse, H_coarse, W_coarse]
         return (input_tuple, label_data)
+    
+    @staticmethod
+    def _to_tensor(val):
+        """Convert a value to a tensor. None becomes a single-element zero sentinel."""
+        if val is None:
+            return torch.tensor([0], dtype=torch.float32)
+        if isinstance(val, torch.Tensor):
+            return val
+        return torch.as_tensor(val)
 
 
 def create_matey_pipeline(base_model, params, global_rank=0):
@@ -119,6 +182,10 @@ def create_matey_pipeline(base_model, params, global_rank=0):
                 inputs, _ = inputs  # Training mode
             
             inp, field_labels, field_labels_out, bcs, leadtime, cond_input, cond_field_labels, cond_fields, is_graph = inputs
+            
+            # is_graph was encoded as a tensor for DeepSpeed compatibility
+            if torch.is_tensor(is_graph):
+                is_graph = is_graph.flatten()[0].item() > 0
             
             device = next(self.space_bag.parameters()).device
             model_dtype = next(self.space_bag.parameters()).dtype
@@ -248,7 +315,7 @@ def create_matey_pipeline(base_model, params, global_rank=0):
                 x_coarsen = rearrange(x_padding, 't b c (d h w) -> t b c d h w', 
                                      d=ntokendim[0], h=ntokendim[1], w=ntokendim[2])
                 x_coarsen = rearrange(x_coarsen, 't b c d h w -> (t b) c d h w')
-                x_coarsen = self.debed_tokenizer(x_coarsen, field_labels[0])
+                x_coarsen = self.debed_tokenizer(x_coarsen)
                 x = rearrange(x_coarsen, '(t b) c d h w -> t b c d h w', t=T.item())
                 
                 # Denormalize
@@ -271,9 +338,11 @@ def create_matey_pipeline(base_model, params, global_rank=0):
         coarse_patch_size = encoder_embed_tokenizer.patch_size
         
         # Encoding stage
-        layers.append(EncodingPipeStage(base_model.space_bag,
+        # space_bag and posbias are ModuleLists indexed by level.
+        # We use the last (finest) level.
+        layers.append(EncodingPipeStage(base_model.space_bag[-1],
                                        encoder_embed_tokenizer,
-                                       base_model.posbias,
+                                       base_model.posbias[-1] if base_model.posbias is not None and len(base_model.posbias) > 0 else None,
                                        params))
         
         # Transformer stages
@@ -285,162 +354,270 @@ def create_matey_pipeline(base_model, params, global_rank=0):
     
     elif params.model_type == 'turbt':
         # TURBT hierarchical model
+        #
+        # turbt.forward() is recursive: starts at finest level, filters down to coarsest,
+        # then processes from coarse → fine with residual connections.
+        # The pipeline must replicate this: filter → per-level (encode+blocks+decode) → upsample
+        #
+        # Pipeline structure for nlevels=3:
+        #   Stage 0: DataFilterStage   - filter full-res data down to coarsest resolution
+        #   Stage 1: LevelEncodeStage  - level 0 (coarsest): normalize + space_bag + tokenize + posbias
+        #   Stage 2-5: TransformerPipeStage - level 0 transformer blocks
+        #   Stage 6: LevelDecodeStage  - level 0: de-tokenize
+        #   Stage 7: LevelTransitionStage - upsample level 0 → level 1, encode level 1
+        #   Stage 8-11: TransformerPipeStage - level 1 blocks
+        #   Stage 12: LevelDecodeStage - level 1
+        #   Stage 13: LevelTransitionStage - upsample level 1 → level 2, encode level 2
+        #   Stage 14-17: TransformerPipeStage - level 2 blocks
+        #   Stage 18: FinalDecodeStage - level 2: decode + denormalize + select output fields
         
-        # tokenizer_ensemble_heads is a ModuleList, not ModuleDict
-        if global_rank == 0:
-            print(f"Tokenizer ensemble heads type: {type(base_model.tokenizer_ensemble_heads)}", flush=True)
-            print(f"Number of tokenizer heads: {len(base_model.tokenizer_ensemble_heads)}", flush=True)
+        nhlevels = params.hierarchical["nlevels"]
+        filtersize = params.hierarchical["filtersize"]
         
-        # Determine which tokenizer head to use
-        head_idx = 0  # Default to first head
+        tkhead_name = "default"
         if hasattr(params, 'tokenizer_heads') and len(params.tokenizer_heads) > 0:
             tkhead_name = params.tokenizer_heads[0]['head_name']
-            if isinstance(tkhead_name, int):
-                head_idx = tkhead_name
-            elif tkhead_name != 'default':
-                try:
-                    head_idx = int(tkhead_name)
-                except (ValueError, TypeError):
-                    if global_rank == 0:
-                        print(f"Warning: Could not parse head_name '{tkhead_name}', using index 0", flush=True)
         
         if global_rank == 0:
-            print(f"Using tokenizer head index: {head_idx}", flush=True)
+            print(f"TURBT pipeline: nhlevels={nhlevels}, filtersize={filtersize}, head='{tkhead_name}'", flush=True)
         
-        # Get the tokenizer head by index
+        # ---- Per-level stage classes for turbt ----
+        
+        class TurbtDataFilterStage(nn.Module):
+            """Filter full-resolution input data down to the coarsest level."""
+            def __init__(self, datafilter_kernel, datafilter_kernel2D, filtersize, nhlevels):
+                super().__init__()
+                # Register kernels as buffers so they move with the module
+                self.register_buffer('datafilter_kernel', datafilter_kernel)
+                self.register_buffer('datafilter_kernel2D', datafilter_kernel2D)
+                self.filtersize = filtersize
+                self.nhlevels = nhlevels
+            
+            def forward(self, inputs):
+                if isinstance(inputs, tuple) and len(inputs) == 2 and isinstance(inputs[0], tuple):
+                    inputs, _ = inputs  # Training mode
+                
+                inp, field_labels, field_labels_out, bcs, leadtime, cond_input, cond_field_labels, cond_fields, is_graph = inputs
+                
+                if torch.is_tensor(is_graph):
+                    is_graph = is_graph.flatten()[0].item() > 0
+                
+                device = self.datafilter_kernel.device
+                model_dtype = self.datafilter_kernel.dtype
+                
+                inp = inp.to(device, dtype=model_dtype)
+                inp = rearrange(inp, 'b t c d h w -> t b c d h w')
+                
+                # Apply filtering (nhlevels-1) times to go from finest to coarsest
+                x = inp
+                for _ in range(self.nhlevels - 1):
+                    T, B, C, D, H, W = x.shape
+                    x_flat = rearrange(x, 't b c d h w -> (t b c) d h w')
+                    if D == 1:
+                        filtered = F.conv3d(x_flat[:, None, :, :, :], self.datafilter_kernel2D,
+                                           stride=(1, self.filtersize, self.filtersize))
+                    else:
+                        filtered = F.conv3d(x_flat[:, None, :, :, :], self.datafilter_kernel,
+                                           stride=self.filtersize)
+                    x = rearrange(filtered, '(t b c) c1 d h w -> t b (c c1) d h w', t=T, b=B, c=C)
+                
+                # Pack metadata as int views for pipeline transport
+                bcs_int = bcs.to(device, dtype=model_dtype).view(torch.int32)
+                leadtime_int = leadtime.to(device, dtype=model_dtype).view(torch.int32)
+                
+                # x is now at coarsest resolution, shape [T, B, C, D_coarse, H_coarse, W_coarse]
+                # Flatten to [B, ...] for pipeline: store as contiguous tensor
+                T, B, C, D, H, W = x.shape
+                shape_info = torch.tensor([T, B, C, D, H, W], dtype=torch.long, device=device)
+                x_flat = x.contiguous().view(T * B * C * D * H * W)
+                
+                return (x_flat, shape_info, field_labels.to(device), field_labels_out.to(device),
+                        bcs_int, leadtime_int,
+                        torch.tensor([is_graph], dtype=torch.bool, device=device))
+        
+        class TurbtLevelEncodeStage(nn.Module):
+            """Normalize, space_bag embed, tokenize, add posbias for one level."""
+            def __init__(self, space_bag, embed_tokenizer, posbias, level_idx):
+                super().__init__()
+                self.space_bag = space_bag
+                self.embed_tokenizer = embed_tokenizer
+                self.posbias = posbias
+                self.level_idx = level_idx
+            
+            def forward(self, inputs):
+                (x_flat, shape_info, field_labels, field_labels_out,
+                 bcs_int, leadtime_int, is_graph_t) = inputs
+                
+                device = next(self.space_bag.parameters()).device
+                model_dtype = next(self.space_bag.parameters()).dtype
+                
+                T, B, C, D, H, W = [s.item() for s in shape_info]
+                x = x_flat.to(device, dtype=model_dtype).view(T, B, C, D, H, W)
+                
+                # Normalize
+                x, data_mean, data_std = normalize_spatiotemporal_persample(x)
+                
+                # Space embedding
+                x_pre = rearrange(x, 't b c d h w -> t b d h w c')
+                x_pre = self.space_bag(x_pre, field_labels)
+                x_pre = rearrange(x_pre, 't b d h w c_emb -> t b c_emb d h w')
+                
+                # Tokenization
+                x_padded_t = rearrange(x_pre, 't b c d h w -> (t b) c d h w')
+                x_tok = self.embed_tokenizer(x_padded_t)
+                x_tok = rearrange(x_tok, '(t b) c d h w -> t b c d h w', t=T)
+                x_tok = rearrange(x_tok, 't b c d h w -> t b c (d h w)')
+                
+                # Positional encoding
+                from functools import reduce
+                from operator import mul
+                space_dims = [D, H, W]
+                ps = self.embed_tokenizer.patch_size
+                ntokendim = [dim // p for dim, p in zip(space_dims, ps)]
+                delta = [1.0 / dim * p for dim, p in zip(space_dims, ps)]
+                
+                t_pos_area = torch.zeros(B, T, ntokendim[0], ntokendim[1], ntokendim[2],
+                                         2 + len(space_dims), device=device, dtype=model_dtype)
+                t_pos_area[..., 0] = repeat(torch.arange(T, device=device),
+                                            "t -> b t d h w", b=B, d=ntokendim[0], h=ntokendim[1], w=ntokendim[2])
+                expand_patterns = {0: "d -> b t d h w", 1: "h -> b t d h w", 2: "w -> b t d h w"}
+                for i in range(len(ntokendim)):
+                    pos = torch.arange(delta[i] * 0.5, 1.0, delta[i], device=device, dtype=model_dtype)
+                    t_pos_area[..., i + 1] = repeat(pos, expand_patterns[i],
+                                                     b=B, t=T, d=ntokendim[0], h=ntokendim[1], w=ntokendim[2])
+                t_pos_area[..., -1] = reduce(mul, delta)
+                
+                tposarea_padding = rearrange(t_pos_area, 'b t d h w c -> b t (d h w) c')
+                x_seq = rearrange(x_tok, 't b c ntoken_tot -> b c (t ntoken_tot)')
+                
+                if self.posbias is not None:
+                    posbias_val = self.posbias(tposarea_padding, mask_padding=None,
+                                               use_zpos=True if D > 1 else False)
+                    posbias_val = rearrange(posbias_val, 'b t L c -> b c (t L)')
+                    x_seq = x_seq + posbias_val
+                
+                # Pack data_mean/data_std as int views
+                data_mean_int = data_mean.view(torch.int32)
+                data_std_int = data_std.view(torch.int32)
+                
+                return (x_seq, shape_info, field_labels, field_labels_out,
+                        bcs_int, leadtime_int, data_mean_int, data_std_int, is_graph_t)
+        
+        class TurbtLevelDecodeStage(nn.Module):
+            """De-tokenize output of transformer blocks for one level.
+            Returns spatial output tensor directly (last pipeline stage)."""
+            def __init__(self, debed_tokenizer, patch_size, level_idx, nhlevels, state_labels_select=False):
+                super().__init__()
+                self.debed_tokenizer = debed_tokenizer
+                self.patch_size = patch_size
+                self.level_idx = level_idx
+                self.nhlevels = nhlevels
+                self.state_labels_select = state_labels_select  # True only for final level
+            
+            def forward(self, inputs):
+                (x_seq, shape_info, field_labels, field_labels_out,
+                 bcs_int, leadtime_int, data_mean_int, data_std_int, is_graph_t) = inputs
+                
+                T, B, C, D, H, W = [s.item() for s in shape_info]
+                
+                # Reshape from sequence back to spatial
+                x = rearrange(x_seq, 'b c (t ntoken_tot) -> t b c ntoken_tot', t=T)
+                ntokendim = [D // self.patch_size[0], H // self.patch_size[1], W // self.patch_size[2]]
+                
+                x = rearrange(x, 't b c (d h w) -> t b c d h w',
+                             d=ntokendim[0], h=ntokendim[1], w=ntokendim[2])
+                x = rearrange(x, 't b c d h w -> (t b) c d h w')
+                x = self.debed_tokenizer(x)
+                x = rearrange(x, '(t b) c d h w -> t b c d h w', t=T)
+                
+                # x now has n_states_out channels (e.g. 33)
+                # Select output fields FIRST (33 -> 4), then denormalize
+                # This matches turbt.forward line 341:
+                #   x_correct[:,state_labels[0],...] * data_std[-1] + data_mean[-1]
+                x_out = x[-1]  # Last timestep: [B, n_states_out, D, H, W]
+                
+                if self.state_labels_select:
+                    x_out = x_out[:, field_labels[0], ...]  # [B, C_sel, D, H, W]
+                
+                # Now denormalize — data_mean/data_std have C_sel channels
+                data_mean = data_mean_int.view(torch.float32).to(x_out.dtype)
+                data_std = data_std_int.view(torch.float32).to(x_out.dtype)
+                # data_mean shape is [1, B, C, 1, 1, 1] from normalize, squeeze T dim
+                data_mean = data_mean.squeeze(0)  # [B, C, 1, 1, 1]
+                data_std = data_std.squeeze(0)
+                x_out = x_out * data_std + data_mean
+                
+                return x_out
+        
+        # ---- Build pipeline for coarsest level only ----
+        # For turbt, pipeline parallelism is applied to the coarsest level (level 0)
+        # which has the smallest data and most of the compute in the transformer blocks.
+        # This is the pragmatic approach since the full multi-level turbt forward is
+        # recursive with inter-level residual connections that don't map to a linear pipeline.
+        
+        imod = 0  # coarsest level
+        
         try:
-            tokenizer_head = base_model.tokenizer_ensemble_heads[head_idx]
-            
-            if global_rank == 0:
-                print(f"Tokenizer head type: {type(tokenizer_head)}", flush=True)
-            
-            # Inspect what's actually in the tokenizer_head
-            if isinstance(tokenizer_head, nn.ModuleDict):
-                actual_keys = list(tokenizer_head.keys())
-                if global_rank == 0:
-                    print(f"Tokenizer head keys: {actual_keys}", flush=True)
-                
-                # Try to find encoder and decoder components with various naming conventions
-                encoder_key = None
-                decoder_key = None
-                
-                for key in actual_keys:
-                    key_lower = key.lower()
-                    if 'embed' in key_lower or 'encode' in key_lower or 'enc' in key_lower:
-                        encoder_key = key
-                    if 'debed' in key_lower or 'decode' in key_lower or 'dec' in key_lower or 'output' in key_lower:
-                        decoder_key = key
-                
-                if encoder_key is None or decoder_key is None:
-                    if global_rank == 0:
-                        print(f"Could not find encoder/decoder keys. Available keys: {actual_keys}", flush=True)
-                        print("Assuming keys are in order: first for encoder, last for decoder", flush=True)
-                    encoder_key = actual_keys[0]
-                    decoder_key = actual_keys[-1]
-                
-                if global_rank == 0:
-                    print(f"Using encoder key: '{encoder_key}', decoder key: '{decoder_key}'", flush=True)
-                
-                embed_tokenizers = tokenizer_head[encoder_key]
-                debed_tokenizers = tokenizer_head[decoder_key]
-                
-            elif hasattr(tokenizer_head, '__dict__'):
-                # Try attribute-based access
-                if global_rank == 0:
-                    print(f"Tokenizer head attributes: {list(vars(tokenizer_head).keys())}", flush=True)
-                
-                # Try common attribute names
-                if hasattr(tokenizer_head, 'embed'):
-                    embed_tokenizers = tokenizer_head.embed
-                    debed_tokenizers = tokenizer_head.debed
-                elif hasattr(tokenizer_head, 'encoder'):
-                    embed_tokenizers = tokenizer_head.encoder
-                    debed_tokenizers = tokenizer_head.decoder
-                else:
-                    raise AttributeError(f"Cannot find encoder/decoder in tokenizer_head with attributes: {list(vars(tokenizer_head).keys())}")
-            else:
-                raise TypeError(f"Unexpected tokenizer_head structure: {type(tokenizer_head)}")
-            
-            # Get the actual tokenizer modules
-            if isinstance(embed_tokenizers, (nn.ModuleList, list)):
-                if global_rank == 0:
-                    print(f"Number of embed tokenizers: {len(embed_tokenizers)}", flush=True)
-                encoder_embed_tokenizer = embed_tokenizers[-1]  # Use last/finest resolution
-                decoder_debed_tokenizer = debed_tokenizers[-1]
-            else:
-                # Single module
-                encoder_embed_tokenizer = embed_tokenizers
-                decoder_debed_tokenizer = debed_tokenizers
-            
-            if global_rank == 0:
-                print(f"Encoder tokenizer type: {type(encoder_embed_tokenizer)}", flush=True)
-                print(f"Decoder tokenizer type: {type(decoder_debed_tokenizer)}", flush=True)
-            
+            head_dict = base_model.tokenizer_ensemble_heads[imod][tkhead_name]
+            encoder_embed_tokenizer = head_dict["embed"][-1]
+            decoder_debed_tokenizer = head_dict["debed"][-1]
             coarse_patch_size = encoder_embed_tokenizer.patch_size
-            if global_rank == 0:
-                print(f"Patch size: {coarse_patch_size}", flush=True)
             
+            if global_rank == 0:
+                print(f"Using coarsest level {imod} for pipeline", flush=True)
+                print(f"Patch size: {coarse_patch_size}", flush=True)
+                print(f"Transformer blocks at level 0: {len(base_model.module_blocks['0'])}", flush=True)
         except Exception as e:
             if global_rank == 0:
-                print(f"Error accessing tokenizer heads: {e}", flush=True)
-                import traceback
-                traceback.print_exc()
+                print(f"Error accessing level {imod} tokenizer: {e}", flush=True)
             raise
         
-        # Encoding stage
-        layers.append(EncodingPipeStage(
-            base_model.space_bag,
-            encoder_embed_tokenizer,
-            base_model.posbias,
-            params
+        # Stage 1: Filter data down to coarsest resolution
+        layers.append(TurbtDataFilterStage(
+            base_model.datafilter_kernel,
+            base_model.datafilter_kernel2D,
+            filtersize, nhlevels
         ))
         
-        # Transformer blocks
+        # Stage 2: Encode at coarsest level
+        layers.append(TurbtLevelEncodeStage(
+            base_model.space_bag[imod],
+            encoder_embed_tokenizer,
+            base_model.posbias[imod] if base_model.posbias is not None and len(base_model.posbias) > 0 else None,
+            imod
+        ))
+        
+        # Stages 3+: Transformer blocks at coarsest level
+        level_blocks = base_model.module_blocks[str(imod)]
         if global_rank == 0:
-            print(f"Processing transformer blocks...", flush=True)
+            print(f"  Level {imod}: {len(level_blocks)} transformer blocks", flush=True)
         
-        if hasattr(base_model, 'hierarchical_blocks'):
-            if global_rank == 0:
-                print(f"Using hierarchical_blocks: {type(base_model.hierarchical_blocks)}", flush=True)
-            # If model explicitly stores hierarchical blocks
-            for level_idx, level_blocks in enumerate(base_model.hierarchical_blocks):
-                if isinstance(level_blocks, (list, nn.ModuleList)):
-                    if global_rank == 0:
-                        print(f"  Level {level_idx}: {len(level_blocks)} blocks", flush=True)
-                    for block in level_blocks:
-                        layers.append(TransformerPipeStage(block))
-                else:
-                    # Single block at this level
-                    if global_rank == 0:
-                        print(f"  Level {level_idx}: single block", flush=True)
-                    layers.append(TransformerPipeStage(level_blocks))
+        # Wrap transformer blocks — the turbt encode stage outputs a different tuple
+        class TurbtTransformerPipeStage(nn.Module):
+            def __init__(self, transformer_block):
+                super().__init__()
+                self.block = transformer_block
+            
+            def forward(self, inputs):
+                (x_seq, shape_info, field_labels, field_labels_out,
+                 bcs_int, leadtime_int, data_mean_int, data_std_int, is_graph_t) = inputs
+                
+                bcs = bcs_int.view(torch.float32).to(x_seq.dtype)
+                leadtime = leadtime_int.view(torch.float32).to(x_seq.dtype)
+                
+                x_seq = self.block(x_seq, bcs=bcs, leadtime=leadtime, mask_padding=None)
+                
+                return (x_seq, shape_info, field_labels, field_labels_out,
+                        bcs_int, leadtime_int, data_mean_int, data_std_int, is_graph_t)
         
-        elif hasattr(base_model, 'blocks'):
-            if global_rank == 0:
-                print(f"Using blocks: {type(base_model.blocks)}", flush=True)
-            # Fallback: treat as sequential blocks
-            if isinstance(base_model.blocks, (list, nn.ModuleList)):
-                if global_rank == 0:
-                    print(f"  Total blocks: {len(base_model.blocks)}", flush=True)
-                for idx, block in enumerate(base_model.blocks):
-                    layers.append(TransformerPipeStage(block))
-            else:
-                raise AttributeError("base_model.blocks is not iterable")
+        for block in level_blocks:
+            layers.append(TurbtTransformerPipeStage(block))
         
-        else:
-            # Last resort: try to find blocks by inspection
-            if global_rank == 0:
-                print("Warning: Could not find 'blocks' or 'hierarchical_blocks' attribute", flush=True)
-                # Print non-private attributes
-                attrs = [attr for attr in dir(base_model) if not attr.startswith('_')]
-                print(f"Available attributes: {attrs[:20]}...", flush=True)  # Print first 20 to avoid spam
-            raise AttributeError("TURBT model does not have expected 'blocks' or 'hierarchical_blocks' attribute")
-        
-        if global_rank == 0:
-            print(f"Total pipeline layers before decoding: {len(layers)}", flush=True)
-        
-        # Decoding stage
-        layers.append(DecodingPipeStage(decoder_debed_tokenizer, coarse_patch_size))
+        # Final stage: Decode at coarsest level
+        layers.append(TurbtLevelDecodeStage(
+            decoder_debed_tokenizer, coarse_patch_size, imod, nhlevels,
+            state_labels_select=True  # Select output fields at final decode
+        ))
         
         if global_rank == 0:
             print(f"Total pipeline layers: {len(layers)}", flush=True)
@@ -464,7 +641,10 @@ def validate_with_pipeline_matey(engine, params, global_rank, world_size, valid_
     
     val_sampler = DistributedSampler(valid_dataset, num_replicas=data_parallel_size, 
                                      rank=dp_rank, shuffle=False)
-    wrapped_valid_dataset = MATEYPipelineDatasetWrapper(valid_dataset)
+    wrapped_valid_dataset = MATEYPipelineDatasetWrapper(
+        valid_dataset,
+        hierarchical=getattr(params, 'hierarchical', None) if params.model_type == 'turbt' else None
+    )
     
     valid_dataloader = DataLoader(
         wrapped_valid_dataset,
@@ -544,19 +724,7 @@ def train_with_pipeline_matey(params, global_rank, local_rank, world_size):
     """
     Main training function with DeepSpeed pipeline parallelism for MATEY.
     """
-    # Build base model
-    if params.model_type == 'avit':
-        base_model = build_avit(params)
-    elif params.model_type == "svit":
-        base_model = build_svit(params)
-    elif params.model_type == "vit_all2all":
-        base_model = build_vit(params)
-    elif params.model_type == "turbt":
-        base_model = build_turbt(params)
-    else:
-        raise ValueError(f"Unknown model type: {params.model_type}")
-    
-    # Get data loaders
+    # Get data loaders FIRST — need dataset to auto-correct n_states before model build
     _, train_dataset, sampler = get_data_loader(
         params, params.train_data_paths, 
         dist.is_initialized(), split='train',
@@ -569,6 +737,28 @@ def train_with_pipeline_matey(params, global_rank, local_rank, world_size):
         dist.is_initialized(), split='val',
         group_size=1, global_rank=global_rank, num_sp_groups=world_size
     )
+    
+    # Auto-correct n_states if too small for the dataset labels
+    # (matches train.py lines 83-87)
+    labels_total = [train_dataset.subset_dict[dset] for dset in train_dataset.subset_dict]
+    labels_total = [item for sublist in labels_total for item in sublist]
+    if params.n_states < max(labels_total) + 1:
+        if global_rank == 0:
+            print(f"Warning, reserved n_states {params.n_states} is too small for datasets, "
+                  f"set it to {max(labels_total)+1} instead")
+        params.n_states = max(labels_total) + 1
+    
+    # Build base model (now with corrected n_states)
+    if params.model_type == 'avit':
+        base_model = build_avit(params)
+    elif params.model_type == "svit":
+        base_model = build_svit(params)
+    elif params.model_type == "vit_all2all":
+        base_model = build_vit(params)
+    elif params.model_type == "turbt":
+        base_model = build_turbt(params)
+    else:
+        raise ValueError(f"Unknown model type: {params.model_type}")
     
     if global_rank == 0:
         print("Creating MATEY pipeline with tuple-based method...")
@@ -594,6 +784,13 @@ def train_with_pipeline_matey(params, global_rank, local_rank, world_size):
         return raw_loss.mean()
     
     # Create pipeline model
+    # DeepSpeed's PipelineModule constructor calls dist.get_rank() through DS's
+    # own comm backend, which must be initialized before PipelineModule is created.
+    # deepspeed.init_distributed() (called in basic_usage.py) sets up torch.distributed
+    # but not necessarily DeepSpeed's internal comm backend (cdb). We ensure it here.
+    if not deepspeed.comm.is_initialized():
+        deepspeed.comm.init_distributed(dist_backend='nccl')
+    
     pipeline_model = PipelineModule(
         layers=layers,
         loss_fn=matey_loss_fn,
@@ -651,14 +848,37 @@ def train_with_pipeline_matey(params, global_rank, local_rank, world_size):
     )
     
     # Prepare data
-    pipeline_dataset = MATEYPipelineDatasetWrapper(train_dataset)
+    # The sampler from get_data_loader is a MultisetBatchSampler (a batch sampler
+    # that yields lists of indices). It must be passed as batch_sampler, not sampler.
+    # batch_size and drop_last are controlled by the batch_sampler itself.
+    pipeline_dataset = MATEYPipelineDatasetWrapper(
+        train_dataset,
+        hierarchical=getattr(params, 'hierarchical', None) if params.model_type == 'turbt' else None
+    )
+    
+    def pipeline_collate(batch):
+        """Collate list of (input_tuple, target) into batched (input_tuple, target).
+        All elements are tensors (None/bool converted in wrapper).
+        """
+        input_tuples, targets = zip(*batch)
+        
+        # Stack targets
+        batched_targets = torch.stack(targets, dim=0)
+        
+        # Stack each element of input_tuple across the batch
+        batched_inputs = []
+        for i in range(len(input_tuples[0])):
+            elems = [t[i] for t in input_tuples]
+            batched_inputs.append(torch.stack(elems, dim=0))
+        
+        return (tuple(batched_inputs), batched_targets)
+    
     pipeline_dataloader = DataLoader(
         pipeline_dataset,
-        batch_size=micro_batch_per_gpu,
-        sampler=sampler,
+        batch_sampler=sampler,
         num_workers=0,
         pin_memory=True,
-        drop_last=True
+        collate_fn=pipeline_collate
     )
     
     if global_rank == 0:
@@ -672,11 +892,6 @@ def train_with_pipeline_matey(params, global_rank, local_rank, world_size):
         print(f"Total training steps: {total_steps} ({params.max_epochs} epochs)")
     
     # Training tracking
-    if global_rank == 0:
-        epoch_losses = []
-        epoch_times = []
-        validation_nrmse_history = []
-    
     last_loss_tensor = torch.tensor(0.0, device=engine.device)
     torch.cuda.reset_peak_memory_stats(engine.device)
     total_start_time = time.time()
@@ -695,31 +910,19 @@ def train_with_pipeline_matey(params, global_rank, local_rank, world_size):
         if (step + 1) % steps_per_epoch == 0:
             current_epoch = (step + 1) // steps_per_epoch
             
-            # Broadcast loss from last pipeline stage
-            if params.pipeline_stages > 1:
-                dist.broadcast(last_loss_tensor, src=engine.grid.get_last_stage_global_rank())
-            
-            # Run validation
-            valid_logs = validate_with_pipeline_matey(engine, params, global_rank, world_size, valid_dataset)
-            
-            if global_rank == 0:
+            # Only the last pipeline stage computes the loss.
+            # Log from last-stage ranks only — no cross-stage collectives needed.
+            if engine.is_last_stage():
                 epoch_duration = time.time() - epoch_start_time
-                epoch_times.append(epoch_duration)
                 current_loss = last_loss_tensor.item()
-                epoch_losses.append(current_loss)
                 
-                if 'valid_nrmse' in valid_logs:
-                    validation_nrmse_history.append(valid_logs['valid_nrmse'].item())
+                print(f"[Stage {engine.stage_id}] Epoch {current_epoch}/{params.max_epochs} "
+                      f"(took {epoch_duration:.2f}s) | Train Loss: {current_loss:.6f}")
                 
-                print(f"--- Finished Epoch {current_epoch}/{params.max_epochs} (took {epoch_duration:.2f}s) ---")
-                if 'valid_nrmse' in valid_logs:
-                    print(f"    Train Loss: {current_loss:.6f} | Valid NRMSE: {valid_logs['valid_nrmse'].item():.6f}")
-                
-                # Save checkpoint
-                if params.save_checkpoint:
-                    # Save DeepSpeed checkpoint
-                    checkpoint_path = os.path.join(params.experiment_dir, 
-                                                  f'training_checkpoints/ckpt_epoch{current_epoch}')
+                # Save checkpoint (DeepSpeed handles multi-stage saving)
+                if params.save_checkpoint and global_rank == 0:
+                    checkpoint_path = os.path.join(params.experiment_dir,
+                                                   f'training_checkpoints/ckpt_epoch{current_epoch}')
                     engine.save_checkpoint(checkpoint_path)
                     print(f"Checkpoint saved: {checkpoint_path}")
             
@@ -729,23 +932,8 @@ def train_with_pipeline_matey(params, global_rank, local_rank, world_size):
     # Final summary
     total_duration = time.time() - total_start_time
     max_allocated_gb = torch.cuda.max_memory_allocated(engine.device) / 1024**3
-    mem_tensor = torch.tensor([max_allocated_gb], device=engine.device)
     
-    if world_size > 1:
-        if global_rank == 0:
-            all_mems = [torch.zeros_like(mem_tensor) for _ in range(world_size)]
-            dist.gather(mem_tensor, all_mems, dst=0)
-        else:
-            dist.gather(mem_tensor, [], dst=0)
-    else:
-        all_mems = [mem_tensor]
-    
-    if global_rank == 0:
+    if engine.is_last_stage() and engine.mpu.get_data_parallel_rank() == 0:
         print(f"\n--- Finished training for {total_steps} steps (Total time: {total_duration:.2f}s) ---")
-        print("\n--- Training Summary ---")
-        print(f"epoch_losses = {epoch_losses}")
-        print(f"validation_nrmse_history = {validation_nrmse_history}")
-        print(f"epoch_times = {epoch_times}")
-        mem_list = [f"Rank {i}: {mem.item():.3f} GB" for i, mem in enumerate(all_mems)]
-        print(f"Peak GPU Memory Allocated per Rank (GB): {', '.join(mem_list)}")
+        print(f"Peak GPU Memory Allocated: {max_allocated_gb:.3f} GB")
         print("\nMATEY Pipeline training completed successfully!")

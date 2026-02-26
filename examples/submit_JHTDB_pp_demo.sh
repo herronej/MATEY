@@ -2,7 +2,7 @@
 #SBATCH -A stf218
 #SBATCH -J matey
 #SBATCH -o logs/%x-%j.out
-#SBATCH -t 00:10:00
+#SBATCH -t 00:30:00
 #SBATCH -p batch
 ##SBATCH -p extended
 #SBATCH -N 2
