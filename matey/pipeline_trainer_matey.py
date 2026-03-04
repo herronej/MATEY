@@ -628,96 +628,87 @@ def create_matey_pipeline(base_model, params, global_rank=0):
     return layers
 
 
-def validate_with_pipeline_matey(engine, params, global_rank, world_size, valid_dataset):
+def validate_with_pipeline_matey(engine, params, global_rank, world_size, valid_dataset,
+                                  pipeline_collate):
     """
     Validation loop for MATEY pipeline.
+    
+    Uses the validation dataset to create a simple eval loop.
+    eval_batch() is a collective across all pipeline stages — every stage
+    must call it the same number of times. It internally handles:
+    - dist.barrier() for synchronization
+    - self.module.eval() / self.module.train() mode transitions
+    - torch.no_grad() context
+    - P2P communication schedule (InferenceSchedule)
+    - Loss broadcast across pipe-parallel group
+    
+    IMPORTANT: Only first-stage and last-stage ranks consume data from the iterator.
+    We do NOT use DistributedSampler because it can produce 0 batches when
+    len(valid_dataset) / dp_size < batch_size, causing StopIteration on the
+    first stage and deadlocking the pipeline.
     """
-    engine.eval()
-    if global_rank == 0:
-        print("\n--- Starting MATEY Validation Phase ---")
+    is_last = engine.is_last_stage()
+    device = engine.device
     
-    data_parallel_size = engine.dp_world_size
-    dp_rank = engine.mpu.get_data_parallel_rank()
-    
-    val_sampler = DistributedSampler(valid_dataset, num_replicas=data_parallel_size, 
-                                     rank=dp_rank, shuffle=False)
+    # Build validation dataloader — same wrapper and collate as training
     wrapped_valid_dataset = MATEYPipelineDatasetWrapper(
         valid_dataset,
         hierarchical=getattr(params, 'hierarchical', None) if params.model_type == 'turbt' else None
     )
     
+    # Use a simple sequential DataLoader — NOT DistributedSampler.
+    # DeepSpeed pipeline only reads data on first and last stages.
+    # DistributedSampler splits data and can produce 0 batches, deadlocking
+    # the pipeline when StopIteration hits on stage 0.
     valid_dataloader = DataLoader(
         wrapped_valid_dataset,
         batch_size=params.batch_size,
-        sampler=val_sampler,
+        shuffle=False,
         num_workers=0,
         pin_memory=True,
-        drop_last=True
+        drop_last=True,
+        collate_fn=pipeline_collate
     )
     
-    device = engine.device
-    total_nrmse = torch.tensor(0.0, device=device)
-    total_l1 = torch.tensor(0.0, device=device)
-    total_rmse = torch.tensor(0.0, device=device)
-    step_count = 0
+    # CRITICAL: All stages must agree on the exact same number of eval steps.
+    # Hardcoded — do NOT compute from len(valid_dataloader) which could differ.
+    # RepeatingLoader ensures we never run out of data.
+    NUM_VAL_STEPS = 5
     
-    with torch.no_grad():
-        for i, data in enumerate(valid_dataloader):
-            outputs = engine.eval_batch(iter([data]))
-            _, targets = data
-            targets = targets.to(outputs.device).float()
-            outputs = outputs.float()
-            
-            # Handle graph vs grid data
-            if targets.dim() == 2:  # Graph data [nnodes, C]
-                residuals = outputs - targets
-                nrmse = (residuals.pow(2).mean() / (1e-7 + targets.pow(2).mean())).sqrt()
-                l1 = F.l1_loss(outputs, targets)
-                rmse = residuals.pow(2).mean().sqrt()
-            else:  # Grid data [B, C, D, H, W]
-                spatial_dims = tuple(range(outputs.ndim))[2:]
-                residuals = outputs - targets
-                tar_norm = 1e-7 + targets.pow(2).mean(spatial_dims, keepdim=True)
-                nrmse = (residuals.pow(2).mean(spatial_dims, keepdim=True) / tar_norm).sqrt().mean()
-                l1 = F.l1_loss(outputs, targets)
-                rmse = residuals.pow(2).mean(spatial_dims).sqrt().mean()
-            
-            total_nrmse += nrmse
-            total_l1 += l1
-            total_rmse += rmse
-            step_count += 1
-            
-            if i >= 5:  # Early stopping for validation
-                break
+    total_loss = torch.tensor(0.0, device=device)
     
-    # Average across steps and DP ranks
-    if step_count > 0:
-        avg_nrmse = total_nrmse / step_count
-        avg_l1 = total_l1 / step_count
-        avg_rmse = total_rmse / step_count
-    else:
-        avg_nrmse = torch.tensor(0.0, device=device)
-        avg_l1 = torch.tensor(0.0, device=device)
-        avg_rmse = torch.tensor(0.0, device=device)
+    valid_iter = iter(RepeatingLoader(valid_dataloader))
     
-    dist.all_reduce(avg_nrmse, op=dist.ReduceOp.SUM)
-    dist.all_reduce(avg_l1, op=dist.ReduceOp.SUM)
-    dist.all_reduce(avg_rmse, op=dist.ReduceOp.SUM)
+    # CRITICAL: Reset cached P2P tensor metadata from training.
+    # DeepSpeed caches activation shapes for efficient P2P communication.
+    # If eval data produces even slightly different tensor metadata
+    # (e.g., different tuple structure from _exec_load_micro_batch),
+    # the cached metadata causes silent P2P failures → deadlock.
+    engine.reset_activation_shape()
     
-    final_nrmse = avg_nrmse / data_parallel_size
-    final_l1 = avg_l1 / data_parallel_size
-    final_rmse = avg_rmse / data_parallel_size
+    for i in range(NUM_VAL_STEPS):
+        # ALL stages must call eval_batch — it runs the full pipeline schedule.
+        # eval_batch internally handles: barrier, no_grad, eval mode, P2P comms.
+        try:
+            loss = engine.eval_batch(data_iter=valid_iter)
+        except Exception as e:
+            import traceback
+            print(f"[Rank {dist.get_rank()} Stage {engine.stage_id}] eval_batch failed at step {i}: {e}", flush=True)
+            traceback.print_exc()
+            # Still need to return something to avoid further crashes
+            return {'valid_loss': torch.tensor(float('nan'), device=device)}
+        
+        # Only the last stage gets non-None loss (broadcast by default)
+        if is_last and loss is not None:
+            total_loss += loss.detach()
     
-    engine.train()
+    # NO all_reduce — just report the per-DP-replica average from the last stage.
+    avg_loss = total_loss / NUM_VAL_STEPS
     
-    if global_rank == 0:
-        print(f"--- Validation Complete ---")
+    # Reset again so training re-caches its own activation shapes
+    engine.reset_activation_shape()
     
-    return {
-        'valid_nrmse': final_nrmse,
-        'valid_l1': final_l1,
-        'valid_rmse': final_rmse
-    }
+    return {'valid_loss': avg_loss}
 
 
 def train_with_pipeline_matey(params, global_rank, local_rank, world_size):
@@ -918,13 +909,31 @@ def train_with_pipeline_matey(params, global_rank, local_rank, world_size):
                 
                 print(f"[Stage {engine.stage_id}] Epoch {current_epoch}/{params.max_epochs} "
                       f"(took {epoch_duration:.2f}s) | Train Loss: {current_loss:.6f}")
-                
-                # Save checkpoint (DeepSpeed handles multi-stage saving)
-                if params.save_checkpoint and global_rank == 0:
-                    checkpoint_path = os.path.join(params.experiment_dir,
-                                                   f'training_checkpoints/ckpt_epoch{current_epoch}')
-                    engine.save_checkpoint(checkpoint_path)
-                    print(f"Checkpoint saved: {checkpoint_path}")
+            
+            # --- Validation ---
+            # ALL stages must call this (eval_batch is a pipeline collective).
+            # Only the last stage gets meaningful loss values.
+            # Add a global barrier to ensure all ranks finish training before eval.
+            dist.barrier()
+            if global_rank == 0:
+                print(f"  Starting validation...", flush=True)
+            val_results = validate_with_pipeline_matey(
+                engine, params, global_rank, world_size,
+                valid_dataset, pipeline_collate
+            )
+            if global_rank == 0:
+                print(f"  Validation completed.", flush=True)
+            
+            if engine.is_last_stage() and engine.mpu.get_data_parallel_rank() == 0:
+                print(f"[Stage {engine.stage_id}] Epoch {current_epoch}/{params.max_epochs} "
+                      f"| Valid Loss: {val_results['valid_loss'].item():.6f}")
+            
+            # Save checkpoint (DeepSpeed handles multi-stage saving)
+            if engine.is_last_stage() and params.save_checkpoint and global_rank == 0:
+                checkpoint_path = os.path.join(params.experiment_dir,
+                                               f'training_checkpoints/ckpt_epoch{current_epoch}')
+                engine.save_checkpoint(checkpoint_path)
+                print(f"Checkpoint saved: {checkpoint_path}")
             
             epoch_start_time = time.time()
             last_loss_tensor.zero_()
