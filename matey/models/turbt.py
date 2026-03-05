@@ -17,6 +17,7 @@ from operator import mul
 from functools import reduce
 from ..utils.forward_options import ForwardOptionsBase
 import torch.distributed as dist
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from ..utils import densenodes_to_graphnodes
 
 def build_turbt(params):
@@ -41,7 +42,8 @@ def build_turbt(params):
                      bias_type=params.bias_type,
                      replace_patch=getattr(params, 'replace_patch', True),
                      hierarchical=getattr(params, 'hierarchical', None),
-                     notransposed=getattr(params, 'notransposed', False)
+                     notransposed=getattr(params, 'notransposed', False),
+                     gradient_checkpointing=getattr(params, 'gradient_checkpointing', False)
                     )
     return model
 
@@ -58,10 +60,11 @@ class TurbT(BaseModel):
         sts_f
     """
     def __init__(self, tokenizer_heads=None, embed_dim=768,  num_heads=12, processor_blocks=8, n_states=6,
-                 drop_path=.2, sts_train=False, sts_model=False, leadtime=False, cond_input=False, n_steps=1, bias_type="none", replace_patch=True, hierarchical=None, notransposed=False):
+                 drop_path=.2, sts_train=False, sts_model=False, leadtime=False, cond_input=False, n_steps=1, bias_type="none", replace_patch=True, hierarchical=None, notransposed=False, gradient_checkpointing=False):
         super().__init__(tokenizer_heads=tokenizer_heads, n_states=n_states,  embed_dim=embed_dim, leadtime=leadtime, cond_input=cond_input, n_steps=n_steps, bias_type=bias_type, hierarchical=hierarchical, 
                          notransposed=notransposed, nlevels=hierarchical["nlevels"] if hierarchical is not None else 1)
         self.drop_path = drop_path
+        self.gradient_checkpointing = gradient_checkpointing
         self.dp = np.linspace(0, drop_path, processor_blocks)
         self.module_blocks=nn.ModuleDict({})
         self.sts_model=sts_model
@@ -293,10 +296,11 @@ class TurbT(BaseModel):
             if not isgraph and leadtime is not None:
                 leadtime = leadtime.repeat(b_mod // B, 1)
             #print("Pei debugging", f"iblk {iblk}, imod {imod}, {x.shape}, CUDA {torch.cuda.memory_allocated()/1024**3} GB")
-            if iblk==0:
-                x = blk(x, sequence_parallel_group=sequence_parallel_group, bcs=bcs, leadtime=leadtime, mask_padding=mask4attblk, local_att=local_att)
+            blk_leadtime = leadtime if iblk == 0 else None
+            if self.gradient_checkpointing and x.requires_grad:
+                x = grad_checkpoint(blk, x, sequence_parallel_group, bcs, blk_leadtime, mask4attblk, None, local_att, use_reentrant=False)
             else:
-                x = blk(x, sequence_parallel_group=sequence_parallel_group, bcs=bcs, leadtime=None, mask_padding=mask4attblk, local_att=local_att)
+                x = blk(x, sequence_parallel_group=sequence_parallel_group, bcs=bcs, leadtime=blk_leadtime, mask_padding=mask4attblk, local_att=local_att)
         #self.debug_nan(x_padding, message="attention block")
         if local_att:
             #nfact=4//ps[-1]
@@ -328,15 +332,19 @@ class TurbT(BaseModel):
         ########upsampling######
         x_correct = x[-1]
         del x
+        torch.cuda.empty_cache()  # defragment before large upsample allocations
         if imod>imod_bottom:
             x_filter =self.filterdata(x_correct[None,...])[0][-1]
-            filtered_eps=self.upsampeldata(x_filter, imod)
+            filtered_eps=grad_checkpoint(self.upsampeldata, x_filter, imod, use_reentrant=False)
+            del x_filter
             x_correct = x_correct - filtered_eps
+            del filtered_eps
             #x_pred=(x_pred-data_mean[-1])/data_std[-1]#a subset of variables for a specific system
-            x_pred=self.upsampeldata(x_pred, imod)
+            x_pred=grad_checkpoint(self.upsampeldata, x_pred, imod, use_reentrant=False)
             #prediction at current level = Refine(pred from previous level) + prediction at current level
             #x_correct[:,var_index,...] = x_pred + x_correct[:,var_index,...] 
-            x_correct = x_correct + x_pred 
+            x_correct = x_correct + x_pred
+            del x_pred
         if imod==self.nhlevels-1:
             x_correct=x_correct[:,state_labels[0],...] * data_std[-1] + data_mean[-1]
         #since no T dim: b c d h w

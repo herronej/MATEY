@@ -33,9 +33,12 @@ mkdir -p ${MIOPEN_USER_DB_PATH}
 
 export MASTER_ADDR=$(hostname -i)
 export MASTER_PORT=3442
+export PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
+export MIOPEN_DEBUG_DISABLE_FIND_DB=1
+export MIOPEN_FIND_MODE=NORMAL
 ##export NCCL_DEBUG=INFO 
 
 HOME=/lustre/orion/stf218/world-shared/emily/MATEY
 
 srun -N$SLURM_JOB_NUM_NODES -n$((SLURM_JOB_NUM_NODES*8)) -c7 --gpu-bind=closest python basic_usage.py \
---run_name $run_name --config $config --yaml_config $yaml_config --use_ddp --use_pipeline --pipeline_stages 4 --zero_stage 1
+--run_name $run_name --config $config --yaml_config $yaml_config --use_ddp --use_pipeline --pipeline_stages 2 --zero_stage 1

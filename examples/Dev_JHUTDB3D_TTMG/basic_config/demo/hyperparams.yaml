@@ -5,7 +5,7 @@ true_time: 'False'
 num_data_workers: '2'
 enable_amp: 'False'
 compile: 'False'
-gradient_checkpointing: 'False'
+gradient_checkpointing: 'True'
 exp_dir: ./Dev_JHUTDB3D_TTMG
 log_interval: '1'
 pretrained: 'False'
@@ -24,7 +24,7 @@ state_names: "['Pressure', 'Vx', 'Vy', 'Density', 'Vx', 'Vy', 'Density', 'Pressu
 dt: '1'
 n_steps: '3'
 enforce_max_steps: 'False'
-accum_grad: '1'
+accum_grad: '2'
 model_type: turbt
 tie_fields: 'False'
 embed_dim: '192'
@@ -34,7 +34,7 @@ tokenizer_heads: "[{'head_name': 'tk-3D', 'patch_size': [[4, 4, 4]]}]"
 hierarchical: "{'filtersize': 2, 'nlevels': 3, 'fixedupsample': False, 'linearupsample':
   False}"
 notransposed: 'False'
-batch_size: '4'
+batch_size: '1'
 sp_groupsize: '8'
 sts_model: 'False'
 sts_train: 'False'
@@ -58,4 +58,4 @@ experiment_dir:
 checkpoint_path: ./Dev_JHUTDB3D_TTMG/basic_config/demo/training_checkpoints/ckpt.tar
 best_checkpoint_path: ./Dev_JHUTDB3D_TTMG/basic_config/demo/training_checkpoints/best_ckpt.tar
 old_checkpoint_path: ./Dev_JHUTDB3D_TTMG/basic_config/demo/training_checkpoints/best_ckpt.tar
-resuming: 'False'
+resuming: 'True'

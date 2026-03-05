@@ -154,7 +154,11 @@ class UpsampleinSpace(nn.Module):
         
     def forward(self, x):
         #B,C,D,H,W
-        x = self.out_proj(x)
+        # Apply layers individually with contiguous() before InstanceNorm3d
+        for layer in self.out_proj:
+            if isinstance(layer, nn.InstanceNorm3d):
+                x = x.contiguous()
+            x = layer(x)
            
         return x
     
@@ -231,7 +235,12 @@ class hMLP_stem(nn.Module):
         self.in_proj = torch.nn.Sequential(*modulelist)
 
     def forward(self, x):
-        x = self.in_proj(x)
+        # Apply layers individually with contiguous() before InstanceNorm3d
+        # to work around MIOpen stride requirements on AMD GPUs
+        for layer in self.in_proj:
+            if isinstance(layer, nn.InstanceNorm3d):
+                x = x.contiguous()
+            x = layer(x)
         return x
 
 class hMLP_output(nn.Module):
@@ -277,7 +286,11 @@ class hMLP_output(nn.Module):
 
     def forward(self, x):
         #B,C,D,H,W
-        x = self.out_proj(x)#.flatten(2).transpose(1, 2)
+        # Apply layers individually with contiguous() before InstanceNorm3d
+        for layer in self.out_proj:
+            if isinstance(layer, nn.InstanceNorm3d):
+                x = x.contiguous()
+            x = layer(x)
         if self.notransposed:
             #x = self.out_upsample(x)
             x = self.out_head(x)

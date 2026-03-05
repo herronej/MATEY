@@ -7,7 +7,7 @@ basic_config: &basic_config
   num_data_workers: 2 # Generally pulling 8 cpu per process, so using 6 for DL - not sure if best ratio
   enable_amp: !!bool False # Use automatic mixed precision - blows up with low variance fields right now
   compile: !!bool False # Compile model - Does not currently work
-  gradient_checkpointing: !!bool False # Whether to use gradient checkpointing - Slow, but lower memory
+  gradient_checkpointing: !!bool True # Whether to use gradient checkpointing - Slow, but lower memory
   exp_dir: './Dev_JHUTDB3D_TTMG' # Output path
   log_interval: 1 # How often to log - Don't think this is actually implemented
   pretrained: !!bool False # Whether to load a pretrained model
@@ -28,7 +28,7 @@ basic_config: &basic_config
   # leadtime_max: 10 #prediction lead time range [1, leadtime_max]
   n_steps: 3 #16 # Length of history to include in input
   enforce_max_steps: !!bool False # If false and n_steps > dataset steps, use dataset steps. Otherwise, raise Exception.
-  accum_grad: 1 
+  accum_grad: 2 # accumulate gradients to compensate for reduced batch_size
   # Model settings
   model_type: 'turbt'
   #model_type:  'vit_all2all' # no need for time_type and space_type inputs
@@ -49,7 +49,7 @@ basic_config: &basic_config
       filtersize: 2
       nlevels: 3 #[2^3, 2^2, 2^1, 2^0]
   notransposed: !!bool False # when True, do not use conv_transposed due to checkerboard artifacts; Default, False
-  batch_size: 64 
+  batch_size: 16 # global batch size; divided by world_size in basic_usage.py (16/16=1 per rank)
   sp_groupsize: 8 #sequence_parallel_groupsize
   #num_sequence_parallel_groups: 1 # number of sequence groups used to split the samples for scalable sequence parallelism for extrem resolutions
   

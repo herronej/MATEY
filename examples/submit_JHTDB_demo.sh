@@ -37,6 +37,7 @@ mkdir -p ${MIOPEN_USER_DB_PATH}
 
 export MASTER_ADDR=$(hostname -i)
 export MASTER_PORT=3442
+export PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
 ##export NCCL_DEBUG=INFO 
 
 srun -N$SLURM_JOB_NUM_NODES -n$((SLURM_JOB_NUM_NODES*8)) -c7 --gpu-bind=closest python basic_usage.py \
