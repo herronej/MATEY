@@ -87,7 +87,7 @@ class BaseHDF53DDataset(Dataset):
 
         # for a given set of len(timesteps) solutions and input length of self.nsteps_input, 
         # the number of segments for (input, next-step prediction) is
-        self.ntimesegs = len(self.timesteps)-self.nsteps_input
+        self.ntimesegs = len(self.timesteps) - self.nsteps_input - 1 #len(self.timesteps) - self.nsteps_input - 1 #self.ntimesegs = len(self.timesteps)-self.nsteps_input
         if self.ntimesegs < 1:
             raise RuntimeError('Error: Path {} has {} steps, but nsteps_input is {}. Please set file steps = max allowable.'.format(path, len(self.timesteps), self.nsteps_input))
 
@@ -230,7 +230,9 @@ class BaseHDF53DDataset(Dataset):
         icz       = self.sample_info[sample_idx]["zcube"]
         if leadtime is None:
             #generate a random leadtime uniformly sampled from [1, self.leadtime_max]
-            leadtime = torch.randint(1, min(self.leadtime_max+1, len(self.timesteps)-time_idx-self.nsteps_input+1), (1,))
+            #leadtime = torch.randint(1, min(self.leadtime_max+1, len(self.timesteps)-time_idx-self.nsteps_input+1), (1,))
+            upper = max(2, min(self.leadtime_max + 1, len(self.timesteps) - time_idx - self.nsteps_input + 1))
+            leadtime = torch.randint(1, upper, (1,))
         else:
             leadtime = min(leadtime, len(self.timesteps)-time_idx-self.nsteps_input)
         
