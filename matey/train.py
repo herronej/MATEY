@@ -21,6 +21,10 @@ from .models.avit import build_avit
 from .models.svit import build_svit
 from .models.vit import build_vit
 from .models.turbt import build_turbt
+from .models.turbt_pipeline import (build_turbt_iterative, build_turbt_pipeline_stages,
+                                     set_pipeline_context, pipeline_forward_sequential,
+                                     pack_interstage, unpack_interstage, PipelineLoss,
+                                     prefilter_all_levels)
 from .utils.logging_utils import Timer, record_function_opt
 from .utils.distributed_utils import get_sequence_parallel_group, locate_group, add_weight_decay, CosineNoIncrease, determine_turt_levels
 from .utils.visualization_utils import checking_data_pred_tar
@@ -185,6 +189,10 @@ class Trainer:
             self.val_sampler.set_epoch(0)
     
     def initialize_model(self):
+        use_pp = getattr(self.params, 'use_pp', False)
+        self._pp_parent = None
+        self._pp_stages = None
+
         if self.params.model_type == 'avit':
             self.model = build_avit(self.params).to(self.device)
         elif self.params.model_type == "svit":
@@ -192,7 +200,16 @@ class Trainer:
         elif self.params.model_type == "vit_all2all":
             self.model = build_vit(self.params).to(self.device)
         elif self.params.model_type == "turbt":
-            self.model = build_turbt(self.params).to(self.device)
+            if use_pp:
+                # Build iterative model (owns all params) + stage wrappers.
+                self._pp_parent, self._pp_stages = build_turbt_pipeline_stages(self.params)
+                self._pp_parent = self._pp_parent.to(self.device)
+                self.model = self._pp_parent
+                for s in self._pp_stages:
+                    s.to(self.device)
+                self.single_print(f'Pipeline parallel: {len(self._pp_stages)} stages')
+            else:
+                self.model = build_turbt(self.params).to(self.device)
 
         if self.params.compile:
             print('WARNING: BFLOAT NOT SUPPORTED IN SOME COMPILE OPS SO SWITCHING TO FLOAT16')

@@ -21,6 +21,7 @@ if __name__ == '__main__':
     parser.add_argument("--run_name", default='00', type=str)
     parser.add_argument("--use_ddp", action='store_true', help='Use distributed data parallel')
     parser.add_argument("--use_fsdp", action='store_true', help='Use FullyShardedDataParallel')
+    parser.add_argument("--use_pp", action='store_true', help='Use pipeline parallelism (iterative TurbT forward)')
     parser.add_argument("--yaml_config", default='./config/multi_ds.yaml', type=str)
     parser.add_argument("--config", default='basic_config', type=str)
     parser.add_argument("--pei_debug", action='store_true', help='Pei debugging flag')
@@ -38,6 +39,10 @@ if __name__ == '__main__':
     params = YParams(os.path.abspath(args.yaml_config), args.config)
     params.use_ddp = args.use_ddp
     params.use_fsdp = args.use_fsdp
+    params.use_pp = args.use_pp
+    # Pipeline parallel implies DDP for gradient sync
+    if args.use_pp:
+        params.use_ddp = True
     params.pei_debug = args.pei_debug
     params.pei_oneloss = args.pei_oneloss
     params.pei_filtered = args.pei_filtered

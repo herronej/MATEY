@@ -1,33 +1,28 @@
 #!/bin/bash
 #SBATCH -A stf218
-#SBATCH -J matey
+#SBATCH -J matey-pp
 #SBATCH -o logs/%x-%j.out
 #SBATCH -t 00:30:00
 #SBATCH -p batch
-##SBATCH -p extended
 #SBATCH -N 2
-##SBATCH -q debug
 #SBATCH -C nvme
 
 export OMP_NUM_THREADS=1
 
 export master_node=$SLURMD_NODENAME
-export run_name="dpp"
+export run_name="demo_pp"
 export config="basic_config" 
 export yaml_config=./config/Demo_JHUTDB_TT.yaml
 
-#source /lustre/orion/world-shared/stf218/junqi/forge/matey-env-rocm631.sh
 module load miniforge3/23.11.0
 module load gcc/12.2.0
 module load rocm/6.3.1
 source "$(conda info --base)/etc/profile.d/conda.sh"
-#conda activate /lustre/orion/stf218/world-shared/emily/MATEY/matey_env
 conda activate /lustre/orion/stf218/world-shared/emily/MATEY/matey_env_3_10
 module unload miniforge3/23.11.0
 export PYTHONPATH="${PYTHONPATH}:$(dirname "$PWD")"
 
 export MIOPEN_USER_DB_PATH=/mnt/bb/$USER/MIOPEN$SLURM_JOB_ID
-#"/tmp/cache"
 export MIOPEN_CUSTOM_CACHE_DIR=${MIOPEN_USER_DB_PATH}
 rm -rf ${MIOPEN_USER_DB_PATH}
 mkdir -p ${MIOPEN_USER_DB_PATH}
@@ -37,5 +32,9 @@ export MASTER_PORT=3442
 ##export NCCL_DEBUG=INFO 
 
 export PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
+
+# Pipeline parallel mode: uses --use_pp which activates the iterative
+# (non-recursive) TurbT forward.  This is the first step towards full
+# DeepSpeed PipelineModule integration.
 srun -N$SLURM_JOB_NUM_NODES -n$((SLURM_JOB_NUM_NODES*8)) -c7 --gpu-bind=closest python basic_usage.py \
---run_name $run_name --config $config --yaml_config $yaml_config --use_ddp
+--run_name $run_name --config $config --yaml_config $yaml_config --use_pp
