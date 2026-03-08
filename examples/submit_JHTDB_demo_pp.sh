@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -A stf218
 #SBATCH -J matey-pp
-#SBATCH -o logs/%x-%j.out
+#SBATCH -o %x-%j.out
 #SBATCH -t 00:30:00
 #SBATCH -p batch
 #SBATCH -N 2

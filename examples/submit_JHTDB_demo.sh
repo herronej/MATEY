@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -A stf218
 #SBATCH -J matey
-#SBATCH -o logs/%x-%j.out
+#SBATCH -o %x-%j.out
 #SBATCH -t 00:30:00
 #SBATCH -p batch
 ##SBATCH -p extended
@@ -12,7 +12,7 @@
 export OMP_NUM_THREADS=1
 
 export master_node=$SLURMD_NODENAME
-export run_name="dpp"
+export run_name="demo"
 export config="basic_config" 
 export yaml_config=./config/Demo_JHUTDB_TT.yaml
 
