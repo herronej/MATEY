@@ -24,7 +24,7 @@ from .models.turbt import build_turbt
 from .models.turbt_pipeline import (build_turbt_iterative, build_turbt_pipeline_stages,
                                      set_pipeline_context, pipeline_forward_sequential,
                                      pack_interstage, unpack_interstage, PipelineLoss,
-                                     prefilter_all_levels)
+                                     prefilter_all_levels, PipelineParallelEngine)
 from .utils.logging_utils import Timer, record_function_opt
 from .utils.distributed_utils import get_sequence_parallel_group, locate_group, add_weight_decay, CosineNoIncrease, determine_turt_levels
 from .utils.visualization_utils import checking_data_pred_tar

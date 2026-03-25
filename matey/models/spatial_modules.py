@@ -5,6 +5,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 import numpy as np
 import math
 from operator import mul
@@ -153,9 +154,9 @@ class UpsampleinSpace(nn.Module):
         self.out_proj = torch.nn.Sequential(*modulelist)
         
     def forward(self, x):
-        #B,C,D,H,W
-        x = self.out_proj(x)
-           
+        #B,C,D,H,W — checkpoint each module to avoid storing all intermediate activations
+        for module in self.out_proj:
+            x = checkpoint(module, x, use_reentrant=False)
         return x
     
 class SubsampledLinear(nn.Module):
@@ -276,21 +277,15 @@ class hMLP_output(nn.Module):
             """
 
     def forward(self, x):
-        #B,C,D,H,W
-        x = self.out_proj(x)#.flatten(2).transpose(1, 2)
+        #B,C,D,H,W — checkpoint each module in out_proj to reduce memory
+        for module in self.out_proj:
+            x = checkpoint(module, x, use_reentrant=False)
         if self.notransposed:
-            #x = self.out_upsample(x)
-            x = self.out_head(x)
-            #x = F.conv3d(x, self.out_kernel[state_labels, :], self.out_bias[state_labels], stride=self.out_stride)
-            #x = x[:,state_labels,...]
+            x = checkpoint(self.out_head, x, use_reentrant=False)
         else:
-            """
-            x = F.conv_transpose3d(x, self.out_kernel[:, state_labels], self.out_bias[state_labels], stride=self.out_stride)
-            """
-            x = self.out_head(x)
+            x = checkpoint(self.out_head, x, use_reentrant=False)
             if self.smooth:
                 x = self.smooth(x)
-            #x = x[:,state_labels,...]
         return x
 
 class GraphhMLP_stem(nn.Module):
